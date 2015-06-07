@@ -4,10 +4,11 @@
 
 typedef struct{
     float *matrix;
-    int rows;
-    int *position;
-    int columns;
-    unsigned int sparseCount;
+    unsigned long long int rows;
+    unsigned long long int *position;
+    unsigned long long int columns;
+    unsigned long long int sparseCount;
+    size_t pitch;
 }Matrix;
 
 void fillMatrix(Matrix*);
@@ -20,7 +21,7 @@ void prepareResultHGPUCopy(Matrix**, Matrix**, Matrix**);
 void retrieveResult(Matrix**);
 
 void kronProd(Matrix*, Matrix*, Matrix**);
-__global__ void multiply(Matrix*, Matrix*, Matrix*, float*);
+__global__ void multiply(Matrix*, Matrix*, Matrix*, unsigned long long int*);
 
 #define checkError(call) { checkGPUError((call), __LINE__); }
 inline void checkGPUError(cudaError_t errCode, int line){
@@ -66,12 +67,9 @@ int main(){
     prepareHostGPUCopy(&b_hgpu, b);
     
     kronProd(a_hgpu, b_hgpu, &c);
-    
+
     retrieveResult(&c);
-    
-    int i;
-    for(i = 0;i < 36;i++)
-        printf("a[%d]: %f\n", i, c -> matrix[i]);
+    printMatrix(c);
 
     cudaFree(a_hgpu -> matrix);
     cudaFree(a_hgpu -> position);
@@ -88,42 +86,44 @@ int main(){
 }
 
 void fillMatrix(Matrix *m){
-    int i, elements;
+    unsigned long long int i, elements, count = 0;
     float a = 5.0;
 
     elements = m -> rows * m -> columns;
     srand((unsigned int)time(NULL));
 
     for(i = 0; i < elements;i++){
-        m -> matrix[i] = ((float)rand()/(float)(RAND_MAX)) * a;
+        printf("%f\t", m -> matrix[i] = ((float)rand()/(float)(RAND_MAX)) * a);
+
+        if(m -> matrix[i] != 0)
+            count++;
+
+        if((i + 1) % m -> columns == 0)
+            printf("\n");
     }
 
+    printf("\n");
+    m -> sparseCount = count;
     COOTheMatrix(m);
 
     return;
 }
 
 void COOTheMatrix(Matrix *m){
-    int i, elements;
-    unsigned int count = 0;
+    unsigned long long int i, elements, count;
     float *holding;
 
+    count = m -> sparseCount;
     elements = m -> rows * m -> columns;
 
-    for(i = 0;i < elements;i++){
-
-        if(m -> matrix[i] != 0){
-            count++;    
-        }
-    }
-    
-    m -> sparseCount = count;
-    m -> position = (int*)malloc(sizeof(int) * count);
+    m -> position = (unsigned long long int*)malloc(sizeof(unsigned long long int) * count * 2);
+    m -> pitch = count * sizeof(unsigned long long int);
     holding = (float*)malloc(sizeof(float) * count);
     
-    for(i = 0, count  = 0;i < elements;i++){
+    for(i = 0, count = 0;i < elements;i++){
         if(m -> matrix[i] != 0){
-            m -> position[count] = i;
+            m -> position[count] = i / (m -> columns);
+            m -> position[m -> sparseCount + count] = i % (m -> columns); 
             holding[count++] = m -> matrix[i];
         }
     }
@@ -135,18 +135,18 @@ void COOTheMatrix(Matrix *m){
 }
 
 void printMatrix(Matrix *m){
-    unsigned int i, elements, count;
+    unsigned long long int i, elements, count;
+    unsigned long long int columns = m -> sparseCount;
 
     elements = m -> rows * m -> columns;
-    float *holding = (float*)malloc(sizeof(float) * elements);
-   
-    for(i = 0, count = 0;i < elements;i++){
-        if(m -> position[count] == i)
-            holding[i] = m -> matrix[count++];
-        else
-            holding[i] = 0;
-
-        printf("%f\t", holding[i]);
+    printf("%llu\n", m -> columns);
+    for(i = 0, count = 0;i < elements && count <= m -> sparseCount;i++){
+      //  if(m -> position[count] == (i / m -> columns) && m -> position[columns + count] == (i % m -> columns)){
+            printf("%f[%llu, %llu]\t", m -> matrix[count], m -> position[count], m -> position[columns + count]);
+            count++;
+      //  }
+      //  else
+      //      printf("0\t");
 
         if((i + 1) % m -> columns == 0)
             printf("\n");
@@ -165,8 +165,8 @@ void prepareHostGPUCopy(Matrix **m_hgpu, Matrix *m){
     checkError(cudaMalloc(&((*m_hgpu) -> matrix), m -> sparseCount * sizeof(float)));
     checkError(cudaMemcpy((*m_hgpu) -> matrix, m -> matrix, m -> sparseCount * sizeof(float), cudaMemcpyHostToDevice));
 
-    checkError(cudaMalloc(&((*m_hgpu) -> position), m -> sparseCount * sizeof(int)));
-    checkError(cudaMemcpy((*m_hgpu) -> position, m -> position, m -> sparseCount * sizeof(int), cudaMemcpyHostToDevice));
+    checkError(cudaMallocPitch(&((*m_hgpu) -> position), &((*m_hgpu) -> pitch), m -> sparseCount * sizeof(unsigned long long int), 2));
+    checkError(cudaMemcpy2D((*m_hgpu) -> position, (*m_hgpu) -> pitch, m -> position, m -> pitch, m -> sparseCount * sizeof(unsigned long long int), 2, cudaMemcpyHostToDevice));
 
     return;
 }
@@ -185,7 +185,10 @@ void prepareResultHGPUCopy(Matrix **c, Matrix **m1, Matrix **m2){
     (*c) -> sparseCount = (*m1) -> sparseCount * (*m2) -> sparseCount;
     (*c) -> rows = (*m1) -> rows * (*m2) -> rows;
     (*c) -> columns = (*m1) -> columns * (*m2) -> columns;
-    
+
+    //Pitch doesn't have to be declared here as this method returns Host GPU copy
+    //Which means that the pitch will be extracted from the cudaMallocPitch call
+
     return;
 }
 
@@ -198,16 +201,17 @@ void retrieveResult(Matrix **m){
     retVal -> columns = (*m) -> columns;
     retVal -> rows = (*m) -> rows;
     retVal -> sparseCount = (*m) -> sparseCount;
+    retVal -> pitch = (*m) -> sparseCount * sizeof(unsigned long long int);
     retVal -> matrix = (float*)malloc(sizeof(float) * (*m) -> sparseCount);
-    retVal -> position = (int*)malloc(sizeof(int) * (*m) -> sparseCount);
-    
-    checkError(cudaMemcpy(retVal -> matrix, (*m) -> matrix, (*m) -> sparseCount * sizeof(float), cudaMemcpyDeviceToHost));
-    checkError(cudaMemcpy(retVal -> position, (*m) -> position, (*m) -> sparseCount * sizeof(int), cudaMemcpyDeviceToHost));
+    retVal -> position = (unsigned long long int*)malloc(sizeof(unsigned long long int) * (*m) -> sparseCount * 2);
 
-    cudaFree((*m) -> matrix);
-    cudaFree((*m) -> position);
-    free(*m);
-    
+    checkError(cudaMemcpy(retVal -> matrix, (*m) -> matrix, (*m) -> sparseCount * sizeof(float), cudaMemcpyDeviceToHost));
+    checkError(cudaMemcpy2D(retVal -> position, retVal -> pitch, (*m) -> position, (*m) -> pitch, (*m) -> sparseCount * sizeof(unsigned long long int), 2, cudaMemcpyDeviceToHost));
+
+    //cudaFree((*m) -> matrix);
+    //cudaFree((*m) -> position);
+    //free(*m);
+   printf("Jio %llu\n", (*m) -> sparseCount); 
     *m = retVal;
     
     return;
@@ -224,7 +228,7 @@ void kronProd(Matrix *a_hgpu, Matrix *b_hgpu, Matrix **c_hgpu){
     prepareResultHGPUCopy(c_hgpu, &a_hgpu, &b_hgpu);
    
     checkError(cudaMalloc(&((*c_hgpu) -> matrix), (*c_hgpu) -> sparseCount * sizeof(float)));
-    checkError(cudaMalloc(&((*c_hgpu) -> position), (*c_hgpu) -> sparseCount * sizeof(int)));
+    checkError(cudaMallocPitch(&((*c_hgpu) -> position), &((*c_hgpu) -> pitch), (*c_hgpu) -> sparseCount * sizeof(unsigned long long int), 2));
 
     prepareGPUCopy(&c_gpu, c_hgpu);
 
@@ -234,13 +238,17 @@ void kronProd(Matrix *a_hgpu, Matrix *b_hgpu, Matrix **c_hgpu){
     unsigned int numBlocks = ((unsigned int)blocks);
     unsigned int threadsPerBlock = 512;
 
-    float *aH = (float*)malloc(sizeof(float) * cSparse);
-    float *aG;
-    checkError(cudaMalloc(&aG, sizeof(float) * cSparse));
+    unsigned long long int *aH = (unsigned long long int*)malloc(sizeof(unsigned long long int) * cSparse);
+    unsigned long long int *aG;
+    checkError(cudaMalloc(&aG, sizeof(unsigned long long int) * cSparse));
     
     multiply<<<numBlocks, threadsPerBlock>>>(a_gpu, b_gpu, c_gpu, aG);
 
-    checkError(cudaMemcpy(aH, aG, sizeof(float) * cSparse, cudaMemcpyDeviceToHost));
+    checkError(cudaMemcpy(aH, aG, sizeof(unsigned long long int) * cSparse, cudaMemcpyDeviceToHost));
+
+    int i;
+    for(i = 0;i < 36;i++)
+        printf("aH[%d]: %llu\n", i, aH[i]);
     
     cudaFree(c_gpu);
     cudaFree(a_gpu);
@@ -249,28 +257,32 @@ void kronProd(Matrix *a_hgpu, Matrix *b_hgpu, Matrix **c_hgpu){
     return;
 }
 
-__global__ void multiply(Matrix *a, Matrix *b, Matrix *c, float *aG){
+__global__ void multiply(Matrix *a, Matrix *b, Matrix *c, unsigned long long int *aG){
 
-    unsigned int i, cDim;
+    unsigned long long int i, cDim;
 
     i = blockIdx.x * blockDim.x + threadIdx.x;
     cDim = a -> sparseCount * b -> sparseCount;
 
     if(i < cDim){
-        unsigned int aIndex = (unsigned int)((double)i / b -> sparseCount);
-        unsigned int bIndex = i % b -> sparseCount;
-        unsigned int unit = b -> rows * b -> columns;
-        unsigned int rowUnit = a -> columns * unit;
-        unsigned int bColumnNum, bRowNum, aColumnNum, aRowNum;
-
-        bColumnNum = (b -> position[bIndex] + 1) % b -> columns;
-        bRowNum = (unsigned int)((double)(b -> position[bIndex] + 1) / b -> columns);
-        aColumnNum = (a -> position[aIndex] + 1) % a -> columns;
-        aRowNum = (a -> position[aIndex] + 1) / a -> columns;
+        unsigned long long int aIndex = (unsigned int)((double)i / b -> sparseCount);
+        unsigned long long int bIndex = i % b -> sparseCount;
 
         c -> matrix[i] = a -> matrix[aIndex] * b -> matrix[bIndex];
-        aG[i] = c -> matrix[i];
-        c -> position[i] = (aColumnNum * b -> columns) + (aRowNum * rowUnit) + bColumnNum + (bRowNum * unit);
+
+        unsigned long long int *cRow0 = (unsigned long long int*)((char*)c -> position); // + (0 * c -> pitch)
+        unsigned long long int *cRow1 = (unsigned long long int*)((char*)c -> position + (1 * c -> pitch));
+
+        unsigned long long int *aRow0 = (unsigned long long int*)((char*)a -> position); // + (0 * a -> pitch)
+        unsigned long long int *aRow1 = (unsigned long long int*)((char*)a -> position + (1 * a -> pitch));
+       
+        unsigned long long int *bRow0 = (unsigned long long int*)((char*)b -> position); // + (0 * b -> pitch)
+        unsigned long long int *bRow1 = (unsigned long long int*)((char*)b -> position + (1 * b -> pitch));
+
+        cRow0[i] = aRow0[aIndex] * (b -> rows) + bRow0[bIndex];
+        cRow1[i] = aRow1[aIndex] * (b -> columns) + bRow1[bIndex];
+
+        aG[i] = aRow1[aIndex];
     }
 
     return;
