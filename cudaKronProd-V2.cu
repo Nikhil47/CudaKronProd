@@ -1,7 +1,11 @@
+//Attempt to store the result in a 2D array to reduce page waste
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
 #include <time.h>
+#include <iterator>
+#include <array>
 #include <cusp/coo_matrix.h>
 #include <thrust/host_vector.h>
 #include <thrust/device_vector.h>
@@ -31,19 +35,19 @@ typedef struct{
     unsigned int valSize;
 }RawMatrix;
 
-void fillMatrix(Matrix*);
+void fillMatrix(Matrix*, int);
 void printMatrix(Matrix*);
 void freeMatrix(Matrix**);
 
 float prepareGPUCopy(Matrix*);
-void prepareResultMatrix(Matrix**, Matrix**, Matrix**);
+void prepareResultMatrix(Matrix**, COODevice*, COODevice*);
 void prepareRawMatrix(COODevice*, RawMatrix**);
 void prepareResultRawMatrix(Matrix*, RawMatrix**);
 
 void retrieveResult(Matrix**);
 float kronProd(COODevice*, COODevice*, Matrix**);
 
-__global__ void multiply(RawMatrix*, RawMatrix*, RawMatrix*, unsigned int*);
+__global__ void multiply(RawMatrix*, RawMatrix*, RawMatrix*);
 float cpuMultiply(COOHost*, COOHost*, COOHost**);
 
 #define checkError(call) { checkGPUError((call), __LINE__); }
@@ -59,7 +63,6 @@ inline void checkGPUError(cudaError_t errCode, int line){
 
 int main(int argc, char *argv[]){
 
-    int i;
     unsigned int dim;
     Matrix *a, *b, *c_gpu, *c_cpu;
     float tTransfer = 0.0, tKronProd = 0.0;
@@ -77,10 +80,9 @@ int main(int argc, char *argv[]){
 
     a = (Matrix*)malloc(sizeof(Matrix));
     b = (Matrix*)malloc(sizeof(Matrix));
-    c_cpu = (Matrix*)malloc(sizeof(Matrix));
-    c_gpu = (Matrix*)malloc(sizeof(Matrix));
+//    c_cpu = (Matrix*)malloc(sizeof(Matrix));
 
-    if(a == NULL || b == NULL || c_cpu == NULL || c_gpu == NULL){
+    if(a == NULL || b == NULL){
         fprintf(stderr, "Failed to allocate memory on CPU\n");
     }
 
@@ -92,11 +94,8 @@ int main(int argc, char *argv[]){
     a -> columns = b -> columns = atoi(argv[2]);
     dim = a -> rows * a -> columns;
 
-    a -> m_host = new COOHost(a -> rows, a -> columns, dim * dim);
-    b -> m_host = new COOHost(b -> rows, b -> columns, dim * dim);
-
-    fillMatrix(a);
-    fillMatrix(b);
+    fillMatrix(a, atoi(argv[3]));
+    fillMatrix(b, atoi(argv[3]));
 
     //printMatrix(a);
     //printMatrix(b);
@@ -104,7 +103,6 @@ int main(int argc, char *argv[]){
     //Kronecker Product being calculated on GPU
     tTransfer += prepareGPUCopy(a);
     tTransfer += prepareGPUCopy(b);
-    prepareResultMatrix(&c_gpu, &a, &b);
 
     tKronProd += kronProd((a -> m_device), (b -> m_device), &c_gpu);
     //delete result matrix, assuming it has been retrieved
@@ -112,7 +110,7 @@ int main(int argc, char *argv[]){
 
     //Write GPU's tTransfer + tKronProd to an external file
     fprintf(gpuReadings, "%u %f %f\n", dim, tTransfer, tKronProd);
-
+/*
     //Kronecker Product being calculated on CPU
     tKronProd = tTransfer = 0.0;
     prepareResultMatrix(&c_cpu, &a, &b);
@@ -122,14 +120,14 @@ int main(int argc, char *argv[]){
     delete c_cpu -> m_device;
 
     //Write CPU's tTransfer + tKronProd to an external file
-    fprintf(cpuReadings, "%u %f %f\n", dim, tTransfer, tKronProd);
-    
-/*    retrieveResult(&c_gpu);
+    fprintf(cpuReadings, "%llu %f %f\n", dim, tTransfer, tKronProd);
+  
+    retrieveResult(&c_gpu);
     printMatrix(c_gpu);
 */    
     freeMatrix(&a);
     freeMatrix(&b);
-    freeMatrix(&c_cpu);
+//    freeMatrix(&c_cpu);
     freeMatrix(&c_gpu);
     
     cudaDeviceSynchronize();
@@ -152,23 +150,27 @@ void freeMatrix(Matrix **m){
     return;
 }
 
-void fillMatrix(Matrix *m){
+void fillMatrix(Matrix *m, int percent){
     unsigned int i, elements, count = 0;
     float a = 5.0;
 
-    elements = m -> rows * m -> columns;
+    elements = (unsigned int)((percent / 100) * m -> rows * m -> columns);
     srand((unsigned int)time(NULL));
 
-    for(i = 0; i < elements;i++){
-        m -> m_host -> values[i] = ((float)rand()/(float)(RAND_MAX)) * a;
-        m -> m_host -> row_indices[count] = i / (m -> columns);
-        m -> m_host -> column_indices[count] = i % (m -> columns); 
+    m -> m_host = new COOHost(m -> rows, m -> columns, elements);
 
-        if(m -> m_host -> values[i] != 0)
+    while(count < elements){
+        unsigned int index = (unsigned int) (elements * ((double) rand() / (RAND_MAX + 1.0)));
+
+        if(!m -> m_host -> values[index]){
+            m -> m_host -> values[count] = ((float)rand()/(float)(RAND_MAX)) * a;
+            m -> m_host -> row_indices[count] = index / (m -> columns);
+            m -> m_host -> column_indices[count] = index % (m -> columns); 
             count++;
+        }
     }
 
-    m -> sparseCount = count;
+    m -> sparseCount = elements;
     return;
 }
 
@@ -215,12 +217,14 @@ float prepareGPUCopy(Matrix *m){
     return time;
 }
 
-void prepareResultMatrix(Matrix **c, Matrix **m1, Matrix **m2){
+void prepareResultMatrix(Matrix **c, COODevice *m1, COODevice *m2){
 
     *c = (Matrix*)malloc(sizeof(Matrix));
-    (*c) -> sparseCount = (*m1) -> sparseCount * (*m2) -> sparseCount;
-    (*c) -> rows = (*m1) -> rows * (*m2) -> rows;
-    (*c) -> columns = (*m1) -> columns * (*m2) -> columns;
+    (*c) -> sparseCount = m1 -> values.size() * m2 -> values.size();
+    (*c) -> rows = m1 -> num_rows * m2 -> num_rows;
+    (*c) -> columns = m1 -> num_cols * m2 -> num_cols;
+
+    (*c) -> m_device = new COODevice((*c) -> rows, (*c) -> columns, (*c) -> sparseCount);
 
     return;
 }
@@ -228,10 +232,11 @@ void prepareResultMatrix(Matrix **c, Matrix **m1, Matrix **m2){
 void retrieveResult(Matrix **m){
 
     (*m) -> m_host = new COOHost((*m) -> rows, (*m) -> columns, (*m) -> sparseCount);
-
     thrust::copy((*m) -> m_device -> row_indices.begin(), (*m) -> m_device -> row_indices.end(), (*m) -> m_host -> row_indices.begin());
     thrust::copy((*m) -> m_device -> column_indices.begin(), (*m) -> m_device -> column_indices.end(), (*m) -> m_host -> column_indices.begin());
     thrust::copy((*m) -> m_device -> values.begin(), (*m) -> m_device -> values.end(), (*m) -> m_host -> values.begin());
+
+    cudaDeviceSynchronize();
 
     return;
 }
@@ -297,7 +302,7 @@ float kronProd(COODevice *a, COODevice *b, Matrix **c){
 
     float time;
     cudaEvent_t start, stop;
-    RawMatrix *aRaw, *bRaw, *cRaw, *cRsltRaw;
+    RawMatrix *aRaw, *bRaw, *cRaw;
 
     //Initializing events to record time taken to multiply the matrices
     cudaEventCreate(&start);
@@ -308,96 +313,46 @@ float kronProd(COODevice *a, COODevice *b, Matrix **c){
     prepareRawMatrix(b, &bRaw);
 
     //Initializing the matrix for GPU, where result will be stored
-    prepareResultRawMatrix(*c, &cRaw);
-   
+    prepareResultMatrix(c, a, b);
+    prepareRawMatrix((*c) -> m_device, &cRaw);
+
     //Calculating the blocks and grid dimensions
     int cSparse = (*c) -> sparseCount;
     float blocks = ceil((float)cSparse / 512);
 
     unsigned int numBlocks = ((unsigned int)blocks);
     unsigned int threadsPerBlock = 512;
-
+/*
     //Initializing the debug array used to check various values being generated in the GPU
-    unsigned int *aH = (unsigned int*)malloc(sizeof(unsigned int) * cSparse);
-    unsigned int *aG;
-    checkError(cudaMalloc(&aG, sizeof(unsigned int) * cSparse));
-
+    float *aH = (float*)malloc(sizeof(float) * cSparse);
+    float *aG;
+    checkError(cudaMalloc(&aG, sizeof(float) * cSparse));
+*/
     //Start recording time
     cudaEventRecord(start, 0);
     
-    multiply<<<numBlocks, threadsPerBlock>>>(aRaw, bRaw, cRaw, aG);
+    multiply<<<numBlocks, threadsPerBlock>>>(aRaw, bRaw, cRaw);
     
     //Stop recording time
     cudaDeviceSynchronize();
     cudaEventRecord(stop, 0);
     cudaEventSynchronize(stop);
-    
+   
+    size_t mem_total, mem_free;
+    cudaMemGetInfo(&mem_free, &mem_total);
+    printf("Memory after multiply: %lu / %lu\n", mem_free, mem_total);
+
     delete a;
     delete b;
-
-    checkError(cudaMemcpy(aH, aG, sizeof(unsigned int) * cSparse, cudaMemcpyDeviceToHost));
-
-    //Retrieving the GPU result raw matrix into a host raw matrix
-    cRsltRaw = (RawMatrix*)malloc(sizeof(RawMatrix));
-    checkError(cudaMemcpy(cRsltRaw, cRaw, sizeof(RawMatrix), cudaMemcpyDeviceToHost));
-
-    cudaFree(aG);
+/*
+    checkError(cudaMemcpy(aH, aG, sizeof(float) * cSparse, cudaMemcpyDeviceToHost));
+*/
     cudaFree(aRaw);
     cudaFree(bRaw);
 
-    //Initializing the coo_matrix in device memory, beginning coo_matrix creation on device memory
-    COOHost c_host = COOHost((*c) -> rows, (*c) -> columns, (*c) -> sparseCount);
-    (*c) -> m_device = new COODevice(c_host);
-
-    //step-1: Casting retreived raw matrix pointers to thrust device pointers
-    //step-2: Converting device pointers to device vectors
-    //step-3: Copying device vectors to coo_matrix on device memory.
-    //step-4: Wait for copy to finish
-    //step-5: Free the raw pointer
-    //step-6: Free the device vectors 
-    thrust::device_ptr<unsigned int> cRow = thrust::device_pointer_cast(cRsltRaw -> row);
-    thrust::device_vector<unsigned int> cVRow(cRow, cRow + cRsltRaw -> valSize);
-    thrust::copy(cVRow.begin(), cVRow.end(), (*c) -> m_device -> row_indices.begin());
     cudaDeviceSynchronize();
-    cudaFree(cRsltRaw -> row);
-    cVRow.resize(0);cVRow.shrink_to_fit();
 
-    thrust::device_ptr<unsigned int> cCol = thrust::device_pointer_cast(cRsltRaw -> column);
-    thrust::device_vector<unsigned int> cVCol(cCol, cCol + cRsltRaw -> valSize);
-    thrust::copy(cVCol.begin(), cVCol.end(), (*c) -> m_device -> column_indices.begin());
-    cudaDeviceSynchronize();
-    cudaFree(cRsltRaw -> column);
-    cVCol.resize(0);cVCol.shrink_to_fit();
-
-    thrust::device_ptr<float> cVal = thrust::device_pointer_cast(cRsltRaw -> values);
-    thrust::device_vector<float> cVVal(cVal, cVal + cRsltRaw -> valSize);
-    thrust::copy(cVVal.begin(), cVVal.end(), (*c) -> m_device -> values.begin());
-    cudaDeviceSynchronize();
-    cudaFree(cRsltRaw -> values);
-    cVVal.resize(0);cVVal.shrink_to_fit();
-
-/*    
-    //Copy to coo_matrix on device memory directly from raw matrix pointers
-    //Saves memory, as creation of device vectors was resulting in copying of data again,
-    //consuming device memory unnecessarily.
-    thrust::copy(cRow, cRow+ cRsltRaw -> valSize, (*c) -> m_device -> row_indices.begin());
-    cudaDeviceSynchronize();
-    cudaFree(cRsltRaw -> row);
-
-    thrust::copy(cCol, cCol + cRsltRaw -> valSize, (*c) -> m_device -> column_indices.begin());
-    cudaDeviceSynchronize();
-    cudaFree(cRsltRaw -> column);
-
-    thrust::copy(cVal, cVal + cRsltRaw -> valSize, (*c) -> m_device -> values.begin());
-    cudaDeviceSynchronize();
-    cudaFree(cRsltRaw -> values);
-    //COO_matrix is on device memory, can be transfered to further kronProd function calls.
-*/
-    cudaFree(cRaw);
-
-    //Free raw device matrix
-    free(cRsltRaw);
-    free(aH);
+//    free(aH);
 
     //calculating time for multiplication
     cudaEventElapsedTime(&time, start, stop);
@@ -405,7 +360,7 @@ float kronProd(COODevice *a, COODevice *b, Matrix **c){
     return time;
 }
 
-__global__ void multiply(RawMatrix *a, RawMatrix *b, RawMatrix *c, unsigned int *aG){
+__global__ void multiply(RawMatrix *a, RawMatrix *b, RawMatrix *c){
 
     unsigned int i, cDim;
     unsigned int aValSize = a -> valSize;
@@ -430,7 +385,7 @@ __global__ void multiply(RawMatrix *a, RawMatrix *b, RawMatrix *c, unsigned int 
         c -> column[index] = cColumnIndex;
         c -> values[index] = a -> values[aIndex] * b -> values[bIndex];
 
-        aG[index] = bRowSize;
+        //aG[index] = c -> values[index];
     }
 
     return;
