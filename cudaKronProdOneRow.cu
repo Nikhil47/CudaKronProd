@@ -462,7 +462,7 @@ __global__ void multiply(RawMatrix *a, RawMatrix *b, RawMatrix *c){
         unsigned int aIndex = (unsigned int)((double)i / bValSize);
         unsigned int bIndex = i % bValSize;
 
-        unsigned int aRow, aCol, bRow, bCol;
+        unsigned int aRow, aCol, bRow, bCol, aTrueRow, bTrueRow, aTrueCol, bTrueCol;
         aRow = (unsigned int)((double)aIndex / aValsize);
         aCol = aIndex % aValsize;
         bRow = (unsigned int)((double)bIndex / bValsize);
@@ -506,7 +506,6 @@ __global__ void multiply(RawMatrix *a, RawMatrix *b, RawMatrix *c){
             bTrueRow = b -> row[bCollapsedIndex] + bRow;
         }
 
-        unsigned int cIndex;
         c -> row[i] = aTrueRow * b -> rows + bTrueRow;
         c -> column[i] = aTrueCol * b -> columns + bTrueCol;
         c -> values[i] = a -> values[aCollapsedIndex] * b -> values[bCollapsedIndex];
